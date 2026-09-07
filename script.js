@@ -18,8 +18,7 @@
     addedApiIds: {},
     knownCardIds: {},      // ids already rendered once — used to gate the entrance animation
     lastTouchedEntryId: null,
-    lastToggledEps: null,  // {seasonId, eps:[...]} — used for the brief "pop" feedback
-    lastAddedSeasonId: null,
+    lastToggledEps: null,  // {entryId, eps:[...]} — used for the brief "pop" feedback
     draggedId: null,
     sortMode: "manual",
     genreFilter: "",
@@ -28,6 +27,12 @@
   };
 
   // ---------- helpers ----------
+  // NOTE: state.entries is populated near the bottom of this file (see "loadEntries()"),
+  // but it MUST happen before this point in execution — Stats/Schedule/Discover render
+  // themselves once, synchronously, right after their functions are defined, and they'd
+  // otherwise always see an empty list. loadEntries/normalizeEntry are plain functions
+  // (hoisted), so calling it here — before they're textually defined — is safe.
+  state.entries = loadEntries();
   function uid(){
     return "id" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
   }
@@ -54,32 +59,21 @@
     return titleObj.english || titleObj.romaji || "Untitled";
   }
 
-  // ---------- season helpers ----------
-  // Keeps season.length (how many episode cells to render) consistent with
-  // season.total (known episode count) and whatever has already been watched.
-  function recomputeSeasonLength(season){
-    var maxWatched = season.watched.length ? Math.max.apply(null, season.watched) : 0;
-    if(season.total){
-      season.length = season.total;
-      season.watched = season.watched.filter(function(n){ return n <= season.total; });
-    } else {
-      season.length = Math.max(season.length || 0, maxWatched, 12);
-    }
-  }
+  // ---------- episode-tracking helpers ----------
+  // Each entry is one season/part — no more nested per-card season list. Adding
+  // a different season of a show just means adding it as its own entry (search
+  // for it and pick a season label), which keeps things simple to reason about.
 
-  function makeSeason(label, total, duration){
-    var season = {
-      id: uid(),
-      label: label || "Season 1",
-      total: total || null,
-      watched: [],
-      length: null,
-      apiId: null,
-      sourceTitle: "",
-      duration: (typeof duration === "number" && duration > 0) ? duration : null
-    };
-    recomputeSeasonLength(season);
-    return season;
+  // Keeps entry.length (how many episode cells to render) consistent with
+  // entry.total (known episode count) and whatever has already been watched.
+  function recomputeLength(entry){
+    var maxWatched = entry.watched.length ? Math.max.apply(null, entry.watched) : 0;
+    if(entry.total){
+      entry.length = entry.total;
+      entry.watched = entry.watched.filter(function(n){ return n <= entry.total; });
+    } else {
+      entry.length = Math.max(entry.length || 0, maxWatched, 12);
+    }
   }
 
   function defaultSeasonLabel(format){
@@ -95,12 +89,8 @@
   // After episodes are toggled, gently nudge status — the person can always override manually.
   function autoStatus(entry){
     if(entry.status === "dropped") return;
-    var watchedCount = 0, totalKnown = 0, anyUnknown = entry.seasons.length === 0;
-    entry.seasons.forEach(function(s){
-      watchedCount += s.watched.length;
-      if(s.total){ totalKnown += s.total; } else { anyUnknown = true; }
-    });
-    if(entry.seasons.length && !anyUnknown && totalKnown > 0 && watchedCount >= totalKnown){
+    var watchedCount = entry.watched.length;
+    if(entry.total && watchedCount >= entry.total){
       entry.status = "completed";
     } else if(watchedCount > 0 && entry.status === "plan"){
       entry.status = "watching";
@@ -109,32 +99,24 @@
     }
   }
 
-  // Finds the next episode to mark watched: the first season (in order) that still
-  // has room, and the lowest-numbered unwatched episode within it. Returns null if
-  // every season with a known total is fully watched (nothing left to quick-bump).
+  // Finds the next episode to mark watched. Returns null once a known total is fully watched.
   function nextUnwatchedEpisode(entry){
-    for(var i = 0; i < entry.seasons.length; i++){
-      var season = entry.seasons[i];
-      var maxWatched = season.watched.length ? Math.max.apply(null, season.watched) : 0;
-      var nextEp = maxWatched + 1;
-      if(season.total && nextEp > season.total) continue; // this season is finished, try the next one
-      return { seasonId: season.id, ep: nextEp, seasonLabel: season.label };
-    }
-    return null;
+    var maxWatched = entry.watched.length ? Math.max.apply(null, entry.watched) : 0;
+    var nextEp = maxWatched + 1;
+    if(entry.total && nextEp > entry.total) return null;
+    return { ep: nextEp };
   }
 
   function aggregateProgress(entry){
-    var watchedCount = 0, totalKnown = 0, anyUnknown = entry.seasons.length === 0;
-    entry.seasons.forEach(function(s){
-      watchedCount += s.watched.length;
-      if(s.total){ totalKnown += s.total; } else { anyUnknown = true; }
-    });
-    return { watchedCount: watchedCount, totalKnown: totalKnown, anyUnknown: anyUnknown };
+    return { watchedCount: entry.watched.length, totalKnown: entry.total || 0, anyUnknown: !entry.total };
   }
 
   // ---------- storage & migration ----------
+  // Returns an ARRAY of entries from one stored record — usually just one, but a
+  // legacy record that had multiple nested seasons gets split into one standalone
+  // entry per season, matching the current one-season-per-card model.
   function normalizeEntry(raw){
-    var entry = {
+    var base = {
       id: raw.id || uid(),
       apiId: raw.apiId || raw.malId || null,
       title: raw.title || "Untitled",
@@ -148,37 +130,51 @@
       collapsed: (typeof raw.collapsed === "boolean") ? raw.collapsed : true,
       notes: raw.notes || "",
       tags: Array.isArray(raw.tags) ? raw.tags.filter(Boolean) : [],
-      seasons: [],
       discovering: false,
       updatedAt: raw.updatedAt || Date.now()
     };
 
+    // Legacy shape: one card held a whole array of seasons. Split each into its own card.
     if(Array.isArray(raw.seasons) && raw.seasons.length){
-      entry.seasons = raw.seasons.map(function(s){
-        var season = {
-          id: s.id || uid(),
-          label: s.label || "Season 1",
-          total: (typeof s.total === "number") ? s.total : null,
-          watched: Array.isArray(s.watched) ? s.watched.slice().filter(function(n){ return Number.isFinite(n); }) : [],
-          length: (typeof s.length === "number") ? s.length : null,
-          apiId: s.apiId || null,
-          sourceTitle: s.sourceTitle || "",
-          duration: (typeof s.duration === "number" && s.duration > 0) ? s.duration : null
-        };
-        recomputeSeasonLength(season);
-        return season;
+      return raw.seasons.map(function(s, i){
+        var entry = Object.assign({}, base);
+        entry.id = (i === 0) ? base.id : uid();
+        entry.apiId = s.apiId || base.apiId;
+        entry.seasonLabel = s.label || "Season 1";
+        entry.sourceTitle = s.sourceTitle || "";
+        entry.total = (typeof s.total === "number") ? s.total : null;
+        entry.watched = Array.isArray(s.watched) ? s.watched.slice().filter(function(n){ return Number.isFinite(n); }) : [];
+        entry.length = (typeof s.length === "number") ? s.length : null;
+        entry.duration = (typeof s.duration === "number" && s.duration > 0) ? s.duration : null;
+        recomputeLength(entry);
+        return entry;
       });
-    } else if(raw.currentEpisode != null || raw.totalEpisodes != null){
-      // migrate from the original single-counter shape
+    }
+
+    // Even older shape: a single flat episode counter, from before seasons existed.
+    if(raw.currentEpisode != null || raw.totalEpisodes != null){
       var cur = Number(raw.currentEpisode) || 0;
       var watchedArr = [];
       for(var i = 1; i <= cur; i++){ watchedArr.push(i); }
-      var season2 = makeSeason(raw.season || "Season 1", raw.totalEpisodes || null);
-      season2.watched = watchedArr;
-      recomputeSeasonLength(season2);
-      entry.seasons = [season2];
+      base.seasonLabel = raw.season || "Season 1";
+      base.sourceTitle = "";
+      base.total = raw.totalEpisodes || null;
+      base.watched = watchedArr;
+      base.length = null;
+      base.duration = null;
+      recomputeLength(base);
+      return [base];
     }
-    return entry;
+
+    // Current flat shape.
+    base.seasonLabel = raw.seasonLabel || "Season 1";
+    base.sourceTitle = raw.sourceTitle || "";
+    base.total = (typeof raw.total === "number") ? raw.total : null;
+    base.watched = Array.isArray(raw.watched) ? raw.watched.slice().filter(function(n){ return Number.isFinite(n); }) : [];
+    base.length = (typeof raw.length === "number") ? raw.length : null;
+    base.duration = (typeof raw.duration === "number" && raw.duration > 0) ? raw.duration : null;
+    recomputeLength(base);
+    return [base];
   }
 
   function loadEntries(){
@@ -187,7 +183,9 @@
       if(!raw) return [];
       var parsed = JSON.parse(raw);
       if(!Array.isArray(parsed)) return [];
-      return parsed.map(normalizeEntry);
+      var out = [];
+      parsed.forEach(function(r){ normalizeEntry(r).forEach(function(e){ out.push(e); }); });
+      return out;
     }catch(e){
       console.error("Failed to load entries", e);
       return [];
@@ -253,10 +251,8 @@
     var totalTitles = state.entries.length;
     var totalEpisodes = 0, totalMinutes = 0;
     state.entries.forEach(function(e){
-      e.seasons.forEach(function(season){
-        totalEpisodes += season.watched.length;
-        totalMinutes += season.watched.length * (season.duration || FALLBACK_EP_MINUTES);
-      });
+      totalEpisodes += e.watched.length;
+      totalMinutes += e.watched.length * (e.duration || FALLBACK_EP_MINUTES);
     });
     statsLineEl.innerHTML =
       '<strong class="stat-pulse">' + totalTitles + "</strong> title" + (totalTitles === 1 ? "" : "s") +
@@ -322,43 +318,38 @@
       '<div class="sprockets"></div>';
   }
 
-  function seasonHtml(season){
-    var total = season.total;
-    var length = season.length || (total || 12);
+  function episodesHtml(entry){
+    var total = entry.total;
+    var length = entry.length || (total || 12);
     var cells = "";
     for(var i = 1; i <= length; i++){
-      var watched = season.watched.indexOf(i) !== -1;
-      var justToggled = state.lastToggledEps && state.lastToggledEps.seasonId === season.id && state.lastToggledEps.eps.indexOf(i) !== -1;
-      cells += '<button type="button" class="ep-cell' + (watched ? " watched" : "") + (justToggled ? " ep-pop" : "") + '" data-action="ep-toggle" data-season-id="' + season.id +
-        '" data-ep="' + i + '" aria-pressed="' + watched + '" title="Episode ' + i + (watched ? " — watched" : " — not watched yet") + '">' + i + "</button>";
+      var watched = entry.watched.indexOf(i) !== -1;
+      var justToggled = state.lastToggledEps && state.lastToggledEps.entryId === entry.id && state.lastToggledEps.eps.indexOf(i) !== -1;
+      cells += '<button type="button" class="ep-cell' + (watched ? " watched" : "") + (justToggled ? " ep-pop" : "") + '" data-action="ep-toggle"' +
+        ' data-ep="' + i + '" aria-pressed="' + watched + '" title="Episode ' + i + (watched ? " — watched" : " — not watched yet") + '">' + i + "</button>";
     }
     if(!total){
-      cells += '<button type="button" class="ep-cell add-ep" data-action="ep-extend" data-season-id="' + season.id +
-        '" title="Add another episode slot" aria-label="Add episode slot">+</button>';
+      cells += '<button type="button" class="ep-cell add-ep" data-action="ep-extend" title="Add another episode slot" aria-label="Add episode slot">+</button>';
     }
     var totalLabel = total ? total : "?";
-    var aniLink = season.apiId
-      ? '<a class="season-ani-link" href="https://anilist.co/anime/' + encodeURIComponent(season.apiId) + '" target="_blank" rel="noopener" title="View on AniList">↗</a>'
+    var aniLink = entry.apiId
+      ? '<a class="season-ani-link" href="https://anilist.co/anime/' + encodeURIComponent(entry.apiId) + '" target="_blank" rel="noopener" title="View on AniList">↗</a>'
       : "";
-    var titleAttr = season.sourceTitle ? (' title="' + escapeHtml(season.sourceTitle) + '"') : "";
-    var seasonEnter = (state.lastAddedSeasonId === season.id) ? " season-enter" : "";
+    var titleAttr = entry.sourceTitle ? (' title="' + escapeHtml(entry.sourceTitle) + '"') : "";
 
     return (
-      '<div class="season' + seasonEnter + '" data-season-id="' + season.id + '">' +
+      '<div class="season">' +
         '<div class="season-head">' +
-          '<input class="season-label-input" data-action="season-label" data-season-id="' + season.id +
-            '" value="' + escapeHtml(season.label) + '"' + titleAttr + ' aria-label="Season label">' +
-          '<input class="season-total-input" data-action="season-total" data-season-id="' + season.id +
-            '" type="number" min="0" value="' + (total != null ? total : "") + '" placeholder="eps" aria-label="Total episodes">' +
+          '<input class="season-label-input" data-action="season-label" value="' + escapeHtml(entry.seasonLabel) + '"' + titleAttr + ' aria-label="Season label">' +
+          '<input class="season-total-input" data-action="season-total" type="number" min="0" value="' + (total != null ? total : "") + '" placeholder="eps" aria-label="Total episodes">' +
           aniLink +
-          '<button type="button" class="season-remove" data-action="season-remove" data-season-id="' + season.id + '" aria-label="Remove season">&times;</button>' +
         "</div>" +
         '<div class="ep-grid">' + cells + "</div>" +
         '<div class="season-actions">' +
-          '<span class="season-progress">' + season.watched.length + " / " + totalLabel + " watched</span>" +
+          '<span class="season-progress">' + entry.watched.length + " / " + totalLabel + " watched</span>" +
           '<span class="season-actions-buttons">' +
-            '<button type="button" class="btn-link" data-action="season-mark-all" data-season-id="' + season.id + '">Mark all watched</button>' +
-            '<button type="button" class="btn-link" data-action="season-clear-all" data-season-id="' + season.id + '">Clear all</button>' +
+            '<button type="button" class="btn-link" data-action="season-mark-all">Mark all watched</button>' +
+            '<button type="button" class="btn-link" data-action="season-clear-all">Clear all</button>' +
           "</span>" +
         "</div>" +
       "</div>"
@@ -366,11 +357,7 @@
   }
 
   function relevantApiId(entry){
-    if(entry.seasons.length){
-      var last = entry.seasons[entry.seasons.length - 1];
-      if(last.apiId) return last.apiId;
-    }
-    return entry.apiId;
+    return entry.apiId || null;
   }
 
   function formatCountdown(airingAtSeconds){
@@ -451,12 +438,8 @@
     }
     var ratingText = entry.rating != null ? (entry.rating + "/10") : "Not rated";
 
-    var seasonsHtml = entry.seasons.length
-      ? entry.seasons.map(seasonHtml).join("")
-      : '<p class="no-seasons">No seasons added yet.</p>';
-
     var discoveringHtml = entry.discovering
-      ? '<p class="discovering-note">Looking for more seasons…</p>'
+      ? '<p class="discovering-note">Fetching details…</p>'
       : "";
 
     var malLink = entry.apiId
@@ -468,10 +451,10 @@
     var nextEp = (entry.status === "dropped") ? null : nextUnwatchedEpisode(entry);
     var quickBumpHtml = nextEp
       ? '<div class="quick-bump">' +
-          '<span class="quick-bump-label">Next: Ep ' + nextEp.ep + (entry.seasons.length > 1 ? " · " + escapeHtml(nextEp.seasonLabel) : "") + "</span>" +
-          '<button type="button" class="quick-bump-btn" data-action="quick-bump" data-season-id="' + nextEp.seasonId + '" data-ep="' + nextEp.ep + '">+ Mark watched</button>' +
+          '<span class="quick-bump-label">Next: Ep ' + nextEp.ep + "</span>" +
+          '<button type="button" class="quick-bump-btn" data-action="quick-bump" data-ep="' + nextEp.ep + '">+ Mark watched</button>' +
         "</div>"
-      : (entry.seasons.length && entry.status !== "dropped" ? '<div class="quick-bump quick-bump-done"><span class="quick-bump-label">All caught up ✓</span></div>' : "");
+      : (entry.status !== "dropped" ? '<div class="quick-bump quick-bump-done"><span class="quick-bump-label">All caught up ✓</span></div>' : "");
 
     return (
       '<article class="card' + pulse + enter + '" draggable="true" data-id="' + entry.id + '" data-status="' + entry.status + '">' +
@@ -498,23 +481,13 @@
           discoveringHtml +
           '<div class="body-spacer"></div>' +
           '<button type="button" class="details-toggle" data-action="toggle-collapse" aria-expanded="' + isOpen + '">' +
-            '<span class="details-toggle-label">' + (isOpen ? "Hide seasons &amp; episodes" : "Show seasons &amp; episodes") + "</span>" +
+            '<span class="details-toggle-label">' + (isOpen ? "Hide episodes" : "Show episodes") + "</span>" +
             '<span class="chevron">▾</span>' +
           "</button>" +
           '<div class="card-collapsible' + (isOpen ? " open" : "") + '">' +
             '<div class="collapsible-inner">' +
-              '<div class="section-label">Seasons</div>' +
-              '<div class="seasons">' + seasonsHtml + "</div>" +
-              '<div class="add-season-zone">' +
-                '<a href="#" class="mini-toggle" data-action="toggle-add-season">+ Add season</a>' +
-                '<div class="mini-form add-season-form">' +
-                  '<div class="row">' +
-                    '<input class="as-label" type="text" placeholder="Label, e.g. Season 2">' +
-                    '<input class="as-total" type="number" min="0" placeholder="Total eps (optional)">' +
-                  "</div>" +
-                  '<button type="button" class="btn btn-primary btn-small" data-action="submit-add-season" style="align-self:flex-start;">Add season</button>' +
-                "</div>" +
-              "</div>" +
+              '<div class="section-label">Episodes</div>' +
+              episodesHtml(entry) +
               '<div class="notes-zone">' +
                 '<div class="section-label">Your notes</div>' +
                 '<textarea class="notes-input" data-action="notes" placeholder="Thoughts, rewatch plans, where you left off…">' + escapeHtml(entry.notes) + "</textarea>" +
@@ -556,7 +529,6 @@
       if(btn) btn.addEventListener("click", openModal);
       state.lastTouchedEntryId = null;
       state.lastToggledEps = null;
-      state.lastAddedSeasonId = null;
       return;
     }
 
@@ -564,7 +536,6 @@
       grid.innerHTML = '<div class="empty-state"><div class="big">No matches</div><p>Try a different filter or search term.</p></div>';
       state.lastTouchedEntryId = null;
       state.lastToggledEps = null;
-      state.lastAddedSeasonId = null;
       return;
     }
 
@@ -572,7 +543,6 @@
     // one-shot animation flags consumed — clear so they don't replay on unrelated re-renders
     state.lastTouchedEntryId = null;
     state.lastToggledEps = null;
-    state.lastAddedSeasonId = null;
   }
 
   function render(){
@@ -611,13 +581,8 @@
   function findEntry(id){
     return state.entries.find(function(e){ return e.id === id; });
   }
-  function findSeason(entry, seasonId){
-    return entry ? entry.seasons.find(function(s){ return s.id === seasonId; }) : null;
-  }
 
   function addEntry(data){
-    var season = makeSeason(defaultSeasonLabel(data.format), data.episodes || null, data.duration || null);
-    if(data.apiId){ season.apiId = data.apiId; }
     var entry = {
       id: uid(),
       apiId: data.apiId || null,
@@ -632,10 +597,16 @@
       collapsed: true,
       notes: "",
       tags: [],
-      seasons: [season],
+      seasonLabel: (data.seasonLabel && data.seasonLabel.trim()) || defaultSeasonLabel(data.format),
+      sourceTitle: "",
+      total: data.episodes || null,
+      watched: [],
+      length: null,
+      duration: (typeof data.duration === "number" && data.duration > 0) ? data.duration : null,
       discovering: !!data.apiId,
       updatedAt: Date.now()
     };
+    recomputeLength(entry);
     state.entries.push(entry);
     saveEntries();
     render();
@@ -682,8 +653,7 @@
   function fetchMediaDetail(id){
     var gql =
       "query ($id: Int) { Media(id: $id, type: ANIME) { id title { romaji english } " +
-      "description(asHtml: true) coverImage { large medium } bannerImage episodes duration format seasonYear genres averageScore " +
-      "relations { edges { relationType node { id type format episodes seasonYear title { romaji english } } } } } }";
+      "description(asHtml: true) coverImage { large medium } bannerImage episodes duration format seasonYear genres averageScore } }";
 
     return fetch("https://graphql.anilist.co", {
       method: "POST",
@@ -698,53 +668,10 @@
     });
   }
 
-  function relationOf(media, type){
-    if(!media || !media.relations || !media.relations.edges) return null;
-    var edge = media.relations.edges.find(function(e){
-      return e.relationType === type && e.node.type === "ANIME" &&
-        (e.node.format === "TV" || e.node.format === "ONA");
-    });
-    return edge ? edge.node : null;
-  }
-
-  // Walks AniList's PREQUEL/SEQUEL relation chain to build a chronological list of seasons.
-  // Only follows TV/ONA entries, so spin-offs/specials/movies don't get pulled in as "seasons".
-  function discoverChain(rootMedia){
-    var chain = [{ id: rootMedia.id, title: pickTitle(rootMedia.title), episodes: rootMedia.episodes, duration: rootMedia.duration || null }];
-    if(rootMedia.format !== "TV" && rootMedia.format !== "ONA") return Promise.resolve(chain);
-
-    function walk(direction, cursor, guard){
-      if(guard > 10) return Promise.resolve();
-      var node = relationOf(cursor, direction);
-      if(!node) return Promise.resolve();
-      return fetchMediaDetail(node.id).then(function(detail){
-        var item = { id: detail.id, title: pickTitle(detail.title), episodes: detail.episodes, duration: detail.duration || null };
-        if(direction === "PREQUEL"){ chain.unshift(item); } else { chain.push(item); }
-        return walk(direction, detail, guard + 1);
-      }).catch(function(){ /* stop this direction quietly on any error */ });
-    }
-
-    return walk("PREQUEL", rootMedia, 0).then(function(){
-      return walk("SEQUEL", rootMedia, 0);
-    }).then(function(){ return chain; });
-  }
-
-  function applyDiscoveredChain(entry, chain){
-    var newSeasons = chain.map(function(c, i){
-      var label = chain.length > 1 ? ("Season " + (i + 1)) : "Season 1";
-      var season = makeSeason(label, c.episodes, c.duration);
-      season.apiId = c.id;
-      season.sourceTitle = c.title;
-      var existing = entry.seasons.find(function(s){ return s.apiId === c.id; });
-      if(existing){
-        season.watched = existing.watched.slice();
-        recomputeSeasonLength(season);
-      }
-      return season;
-    });
-    entry.seasons = newSeasons;
-  }
-
+  // Fills in description/genres/cover/episode-count for the one show that was added.
+  // Deliberately does NOT walk AniList's prequel/sequel chain or create extra seasons —
+  // if you want a different season of a show tracked, search for it and add it as its
+  // own entry (with its own season label), rather than having it auto-merged in here.
   function runDiscovery(entryId, apiId){
     fetchMediaDetail(apiId).then(function(root){
       var entry = findEntry(entryId);
@@ -755,21 +682,15 @@
       entry.communityScore = (typeof root.averageScore === "number") ? root.averageScore : null;
       entry.banner = root.bannerImage || "";
       if(!entry.image && root.coverImage){ entry.image = root.coverImage.large || root.coverImage.medium || ""; }
+      if(!entry.total && root.episodes){ entry.total = root.episodes; recomputeLength(entry); }
+      if(!entry.duration && root.duration){ entry.duration = root.duration; }
+      entry.sourceTitle = pickTitle(root.title);
 
-      return discoverChain(root).then(function(chain){
-        var entry2 = findEntry(entryId);
-        if(!entry2) return;
-        if(chain.length > 1){
-          applyDiscoveredChain(entry2, chain);
-          autoStatus(entry2);
-        } else if(entry2.seasons[0]){
-          entry2.seasons[0].sourceTitle = chain[0].title;
-        }
-        entry2.discovering = false;
-        entry2.updatedAt = Date.now();
-        saveEntries();
-        render();
-      });
+      entry.discovering = false;
+      entry.updatedAt = Date.now();
+      autoStatus(entry);
+      saveEntries();
+      render();
     }).catch(function(){
       var entry = findEntry(entryId);
       if(entry){
@@ -803,7 +724,7 @@
       var isOpen = collapsible.classList.toggle("open");
       collapseToggle.setAttribute("aria-expanded", String(isOpen));
       var label = collapseToggle.querySelector(".details-toggle-label");
-      if(label) label.textContent = isOpen ? "Hide seasons & episodes" : "Show seasons & episodes";
+      if(label) label.textContent = isOpen ? "Hide episodes" : "Show episodes";
       var entryForCollapse = findEntry(cardEl.getAttribute("data-id"));
       if(entryForCollapse){
         entryForCollapse.collapsed = !isOpen;
@@ -820,21 +741,19 @@
     if(!entry) return;
 
     var action = actionEl.getAttribute("data-action");
-    var seasonId = actionEl.getAttribute("data-season-id");
-    var season = seasonId ? findSeason(entry, seasonId) : null;
 
     if(action === "remove-anime"){
       removeEntry(entry.id);
 
-    } else if(action === "quick-bump" && season){
+    } else if(action === "quick-bump"){
       var bumpEp = parseInt(actionEl.getAttribute("data-ep"), 10);
-      if(!season.total && bumpEp > (season.length || 0)){ season.length = bumpEp; } // make room in the grid if needed
-      if(season.watched.indexOf(bumpEp) === -1){ season.watched.push(bumpEp); }
-      season.watched.sort(function(a, b){ return a - b; });
+      if(!entry.total && bumpEp > (entry.length || 0)){ entry.length = bumpEp; } // make room in the grid if needed
+      if(entry.watched.indexOf(bumpEp) === -1){ entry.watched.push(bumpEp); }
+      entry.watched.sort(function(a, b){ return a - b; });
       autoStatus(entry);
       entry.updatedAt = Date.now();
       state.lastTouchedEntryId = entry.id;
-      state.lastToggledEps = { seasonId: season.id, eps: [bumpEp] };
+      state.lastToggledEps = { entryId: entry.id, eps: [bumpEp] };
       saveEntries(); render();
 
     } else if(action === "rating-bar"){
@@ -844,86 +763,47 @@
       state.lastTouchedEntryId = entry.id;
       saveEntries(); render();
 
-    } else if(action === "ep-toggle" && season){
+    } else if(action === "ep-toggle"){
       var ep = parseInt(actionEl.getAttribute("data-ep"), 10);
-      var idx = season.watched.indexOf(ep);
+      var idx = entry.watched.indexOf(ep);
       if(idx === -1){
         // marking watched — fill in any earlier gaps too, so progress reads as "watched through ep N"
         var newlyFilled = [];
         for(var fillEp = 1; fillEp <= ep; fillEp++){
-          if(season.watched.indexOf(fillEp) === -1){ season.watched.push(fillEp); newlyFilled.push(fillEp); }
+          if(entry.watched.indexOf(fillEp) === -1){ entry.watched.push(fillEp); newlyFilled.push(fillEp); }
         }
-        state.lastToggledEps = { seasonId: season.id, eps: newlyFilled };
+        state.lastToggledEps = { entryId: entry.id, eps: newlyFilled };
       } else {
-        season.watched.splice(idx, 1);
+        entry.watched.splice(idx, 1);
         state.lastToggledEps = null;
       }
-      season.watched.sort(function(a, b){ return a - b; });
+      entry.watched.sort(function(a, b){ return a - b; });
       autoStatus(entry);
       entry.updatedAt = Date.now();
       state.lastTouchedEntryId = entry.id;
       saveEntries(); render();
 
-    } else if(action === "ep-extend" && season){
-      season.length = (season.length || 12) + 1;
+    } else if(action === "ep-extend"){
+      entry.length = (entry.length || 12) + 1;
       state.lastTouchedEntryId = entry.id;
       saveEntries(); render();
 
-    } else if(action === "season-mark-all" && season){
-      var len = season.total || season.length || 12;
+    } else if(action === "season-mark-all"){
+      var len = entry.total || entry.length || 12;
       var arr = [];
       for(var i = 1; i <= len; i++){ arr.push(i); }
-      season.watched = arr;
+      entry.watched = arr;
       autoStatus(entry);
       entry.updatedAt = Date.now();
       state.lastTouchedEntryId = entry.id;
       saveEntries(); render();
 
-    } else if(action === "season-clear-all" && season){
-      season.watched = [];
+    } else if(action === "season-clear-all"){
+      entry.watched = [];
       autoStatus(entry);
       entry.updatedAt = Date.now();
       state.lastTouchedEntryId = entry.id;
       saveEntries(); render();
-
-    } else if(action === "season-remove" && season){
-      var removedIdx = entry.seasons.indexOf(season);
-      entry.seasons = entry.seasons.filter(function(s){ return s.id !== seasonId; });
-      autoStatus(entry);
-      entry.updatedAt = Date.now();
-      state.lastTouchedEntryId = entry.id;
-      saveEntries(); render();
-      showToast('Removed "' + season.label + '".', {
-        actionLabel: "Undo",
-        duration: 5000,
-        onAction: function(){
-          var e2 = findEntry(entry.id);
-          if(!e2) return;
-          e2.seasons.splice(removedIdx, 0, season);
-          autoStatus(e2);
-          e2.updatedAt = Date.now();
-          saveEntries(); render();
-        }
-      });
-
-    } else if(action === "toggle-add-season"){
-      ev.preventDefault();
-      var azone = actionEl.closest(".add-season-zone");
-      azone.querySelector(".add-season-form").classList.toggle("open");
-
-    } else if(action === "submit-add-season"){
-      var zone2 = actionEl.closest(".add-season-zone");
-      var labelInput = zone2.querySelector(".as-label");
-      var totalInput = zone2.querySelector(".as-total");
-      var label = labelInput.value.trim() || ("Season " + (entry.seasons.length + 1));
-      var totalVal = totalInput.value ? Math.max(0, parseInt(totalInput.value, 10)) : null;
-      var newSeason = makeSeason(label, totalVal);
-      entry.seasons.push(newSeason);
-      entry.updatedAt = Date.now();
-      state.lastTouchedEntryId = entry.id;
-      state.lastAddedSeasonId = newSeason.id;
-      saveEntries(); render();
-      showToast('Added "' + label + '".');
 
     } else if(action === "remove-tag"){
       var tagToRemove = actionEl.getAttribute("data-tag");
@@ -958,8 +838,6 @@
     if(!entry) return;
 
     var action = ev.target.getAttribute("data-action");
-    var seasonId = ev.target.getAttribute("data-season-id");
-    var season = seasonId ? findSeason(entry, seasonId) : null;
 
     if(action === "status"){
       entry.status = ev.target.value;
@@ -972,16 +850,16 @@
       entry.updatedAt = Date.now();
       saveEntries(); render();
 
-    } else if(action === "season-label" && season){
-      season.label = ev.target.value.trim() || season.label;
+    } else if(action === "season-label"){
+      entry.seasonLabel = ev.target.value.trim() || entry.seasonLabel;
       entry.updatedAt = Date.now();
       state.lastTouchedEntryId = entry.id;
       saveEntries(); render();
 
-    } else if(action === "season-total" && season){
+    } else if(action === "season-total"){
       var v = ev.target.value;
-      season.total = v ? Math.max(0, parseInt(v, 10)) : null;
-      recomputeSeasonLength(season);
+      entry.total = v ? Math.max(0, parseInt(v, 10)) : null;
+      recomputeLength(entry);
       autoStatus(entry);
       entry.updatedAt = Date.now();
       state.lastTouchedEntryId = entry.id;
@@ -1171,16 +1049,19 @@
     }
     var totalRaw = document.getElementById("manualTotal").value;
     var image = document.getElementById("manualImage").value.trim();
+    var seasonLabelEl = document.getElementById("addSeasonLabel");
     addEntry({
       title: title,
       episodes: totalRaw ? Math.max(0, parseInt(totalRaw, 10)) : null,
       image: image,
-      format: ""
+      format: "",
+      seasonLabel: seasonLabelEl ? seasonLabelEl.value.trim() : ""
     });
     showToast('Added "' + title + '" to your log.');
     document.getElementById("manualTitle").value = "";
     document.getElementById("manualTotal").value = "";
     document.getElementById("manualImage").value = "";
+    if(seasonLabelEl){ seasonLabelEl.value = ""; }
   });
 
   document.getElementById("bulkToggle").addEventListener("click", function(ev){
@@ -1246,7 +1127,7 @@
       if(skipped.length) parts.push(skipped.length + " already in your log");
       if(notFound.length) parts.push(notFound.length + " not found (" + notFound.join(", ") + ")");
       statusEl.textContent = parts.join(" · ");
-      if(added.length) showToast("Bulk-added " + added.length + " title" + (added.length === 1 ? "" : "s") + " — looking up seasons and details…");
+      if(added.length) showToast("Bulk-added " + added.length + " title" + (added.length === 1 ? "" : "s") + " — fetching details…");
     }
 
     function next(){
@@ -1315,11 +1196,14 @@
     var apiId = btn.getAttribute("data-apiid");
     var item = lastResults.find(function(r){ return String(r.apiId) === String(apiId); });
     if(!item) return;
+    var seasonLabelEl = document.getElementById("addSeasonLabel");
+    if(seasonLabelEl && seasonLabelEl.value.trim()){ item = Object.assign({}, item, { seasonLabel: seasonLabelEl.value.trim() }); }
     addEntry(item);
     state.addedApiIds[item.apiId] = true;
     btn.disabled = true;
     btn.textContent = "Added ✓";
-    showToast('Added "' + item.title + '" to your log — looking for more seasons and details…');
+    showToast('Added "' + item.title + '" to your log — fetching details…');
+    if(seasonLabelEl){ seasonLabelEl.value = ""; }
   });
 
   // AniList GraphQL search — public, CORS-enabled, no API key required.
@@ -1408,10 +1292,8 @@
       statusCounts[e.status] = (statusCounts[e.status] || 0) + 1;
       (e.genres || []).forEach(function(g){ genreCounts[g] = (genreCounts[g] || 0) + 1; });
       if(e.rating != null){ ratedCount++; ratingSum += e.rating; ratingCounts[e.rating] = (ratingCounts[e.rating] || 0) + 1; }
-      e.seasons.forEach(function(season){
-        totalEpisodes += season.watched.length;
-        totalMinutes += season.watched.length * (season.duration || FALLBACK_EP_MINUTES);
-      });
+      totalEpisodes += e.watched.length;
+      totalMinutes += e.watched.length * (e.duration || FALLBACK_EP_MINUTES);
     });
 
     var statusMax = Math.max.apply(null, statusOrder.map(function(k){ return statusCounts[k] || 0; }).concat([1]));
@@ -1527,15 +1409,11 @@
     items.forEach(function(e){
       var m = e.media;
       var status = IMPORT_STATUS_MAP[e.status] || "plan";
-      var season = makeSeason(defaultSeasonLabel(m.format), m.episodes || null, m.duration || null);
-      season.apiId = m.id;
       var progress = Number(e.progress) || 0;
       var watchedArr = [];
       for(var i = 1; i <= progress; i++){ watchedArr.push(i); }
-      season.watched = watchedArr;
-      recomputeSeasonLength(season);
 
-      state.entries.push({
+      var entry = {
         id: uid(),
         apiId: m.id,
         title: pickTitle(m.title),
@@ -1549,10 +1427,17 @@
         collapsed: true,
         notes: "",
         tags: [],
-        seasons: [season],
+        seasonLabel: defaultSeasonLabel(m.format),
+        sourceTitle: "",
+        total: m.episodes || null,
+        watched: watchedArr,
+        length: null,
+        duration: (typeof m.duration === "number" && m.duration > 0) ? m.duration : null,
         discovering: false,
         updatedAt: Date.now()
-      });
+      };
+      recomputeLength(entry);
+      state.entries.push(entry);
     });
     saveEntries();
     render();
@@ -1712,10 +1597,8 @@
     var ratedCount = 0, ratingSum = 0;
     var genreCounts = {};
     state.entries.forEach(function(e){
-      e.seasons.forEach(function(season){
-        totalEpisodes += season.watched.length;
-        totalMinutes += season.watched.length * (season.duration || FALLBACK_EP_MINUTES);
-      });
+      totalEpisodes += e.watched.length;
+      totalMinutes += e.watched.length * (e.duration || FALLBACK_EP_MINUTES);
       if(e.rating != null){ ratedCount++; ratingSum += e.rating; }
       (e.genres || []).forEach(function(g){ genreCounts[g] = (genreCounts[g] || 0) + 1; });
     });
@@ -1860,15 +1743,15 @@
       showToast("Your log is empty — nothing to export yet.");
       return;
     }
-    var headers = ["Title", "Status", "Rating", "Seasons", "Episodes Watched", "Genres", "Tags", "AniList URL"];
+    var headers = ["Title", "Season", "Status", "Rating", "Episodes Watched", "Genres", "Tags", "AniList URL"];
     var rows = state.entries.map(function(e){
-      var episodesWatched = e.seasons.reduce(function(sum, s){ return sum + s.watched.length; }, 0);
+      var episodesWatched = e.watched.length;
       var anilistUrl = e.apiId ? ("https://anilist.co/anime/" + e.apiId) : "";
       return [
         e.title,
+        e.seasonLabel,
         statusMeta[e.status] ? statusMeta[e.status].label : e.status,
         e.rating != null ? e.rating : "",
-        e.seasons.length,
         episodesWatched,
         (e.genres || []).join("; "),
         (e.tags || []).join("; "),
@@ -1906,7 +1789,9 @@
         if(!Array.isArray(parsed)) throw new Error("not-array");
         var ok = confirm("Import " + parsed.length + " title(s)? This replaces your current log of " + state.entries.length + " title(s).");
         if(!ok) return;
-        state.entries = parsed.map(normalizeEntry);
+        var restored = [];
+        parsed.forEach(function(r){ normalizeEntry(r).forEach(function(e){ restored.push(e); }); });
+        state.entries = restored;
         state.knownCardIds = {};
         saveEntries();
         render();
@@ -2105,7 +1990,6 @@
   }
 
   // ---------- init ----------
-  state.entries = loadEntries();
   render();
   // schedule.html already fetches airing info itself (see the guard above) — avoid firing it twice
   if(!document.getElementById("schedulePageBody")){
